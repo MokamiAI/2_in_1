@@ -1,571 +1,904 @@
+# =============================================================================
+# recommendation_engine.py
+# =============================================================================
+# Reads bureau_features + fnb_product_master to recommend products
+# based on client's primary_interest.
+#
+# TIER LOGIC:
+#   tier 1 = entry product  (most accessible — lowest barrier)
+#   tier 2 = step-up product within the SAME product category
+#
+#   Engine shows tier 1 as BEST RECOMMENDATION.
+#   Engine shows tier 2 as NEXT BEST RECOMMENDATION.
+#   If client qualifies for NEITHER tier → columns remain null for that interest.
+#
+# CATALOGUE ITEM SELECTION:
+#   Each tier has catalogue_item_1 and catalogue_item_2.
+#   Client profile score (0–8) determines which item is selected:
+#     Score 0–3  → catalogue_item_1  (entry variant)
+#     Score 4–8  → catalogue_item_2  (step-up variant)
+#   Score signals:
+#     credit_score >= 700   +3
+#     credit_score 600–699  +2
+#     credit_score < 600    +1
+#     is_employed           +2
+#     active_director       +1
+#     no adverse listings   +1
+#     existing FNB account  +1
+#   Max = 8
+#
+# REASON FIELD:
+#   Built from catalogue item highlights only.
+#   No URLs, no "FNB" prefix, no "credit" language.
+#   amount_range and example_repayment appended where present.
+#
+# SCHEMA:
+#   Writes to fnb_recommendations — 19 interests × 8 columns = 152 columns.
+#   No legacy flow-level columns (account_rec_*, connect_rec_* etc.) —
+#   those have been removed from the schema.
+#
+# INTEREST → COLUMN PREFIX MAP:
+#   FNB Account Opening                    → acct_
+#   FNB Connect - SIM                      → sim_
+#   FNB Connect - Phone - Under R300       → phn_u300_
+#   FNB Connect - Phone - R300-R600        → phn_300600_
+#   FNB Connect - Phone - R600+            → phn_600p_
+#   FNB Insurance - Car                    → ins_car_
+#   FNB Insurance - Home                   → ins_home_
+#   FNB Insurance - Life                   → ins_life_
+#   FNB Insurance - Legacy Plan            → ins_legacy_
+#   FNB Insurance - Funeral Cover          → ins_funeral_
+#   FNB Insurance - Income Protector       → ins_income_
+#   FNB Loan - Personal Loan               → loan_pl_
+#   FNB Loan - Credit Switch               → loan_cs_
+#   FNB Loan - Vehicle Finance Dealership  → loan_vfd_
+#   FNB Loan - Vehicle Finance Private     → loan_vfp_
+#   FNB Loan - Vehicle Finance Leisure     → loan_vfl_
+#   FNB Loan - Building Loan               → loan_build_
+#   FNB Loan - Refinance Loan              → loan_refi_
+#   FNB Loan - Further Loan                → loan_furt_
+# =============================================================================
+
 from __future__ import annotations
 
-import time
+import json
 import uuid
-from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from postgrest.exceptions import APIError
 
 from app.db.supabase_client import supabase
+from app.services.bureau_extractor import (
+    extract_bureau_features,
+    get_latest_bureau_features,
+)
 
-BUREAU = "XDS"
 
-# -----------------------------
-# Small utilities
-# -----------------------------
+# =============================================================================
+# Interest → column prefix  (matches fnb_recommendations schema exactly)
+# =============================================================================
+
+INTEREST_COLUMN_PREFIX: Dict[str, str] = {
+    "FNB Account Opening":                   "acct_",
+    "FNB Connect - SIM":                     "sim_",
+    "FNB Connect - Phone - Under R300":      "phn_u300_",
+    "FNB Connect - Phone - R300-R600":       "phn_300600_",
+    "FNB Connect - Phone - R600+":           "phn_600p_",
+    "FNB Insurance - Car":                   "ins_car_",
+    "FNB Insurance - Home":                  "ins_home_",
+    "FNB Insurance - Life":                  "ins_life_",
+    "FNB Insurance - Legacy Plan":           "ins_legacy_",
+    "FNB Insurance - Funeral Cover":         "ins_funeral_",
+    "FNB Insurance - Income Protector":      "ins_income_",
+    "FNB Loan - Personal Loan":              "loan_pl_",
+    "FNB Loan - Credit Switch":              "loan_cs_",
+    "FNB Loan - Vehicle Finance Dealership": "loan_vfd_",
+    "FNB Loan - Vehicle Finance Private":    "loan_vfp_",
+    "FNB Loan - Vehicle Finance Leisure":    "loan_vfl_",
+    "FNB Loan - Building Loan":              "loan_build_",
+    "FNB Loan - Refinance Loan":             "loan_refi_",
+    "FNB Loan - Further Loan":               "loan_furt_",
+}
+
+ALL_INTERESTS: List[str] = list(INTEREST_COLUMN_PREFIX.keys())
+
+# Flow groupings — used only for option_recommendations JSONB snapshot
+FLOW_REPRESENTATIVE_INTERESTS: Dict[str, List[str]] = {
+    "Account": ["FNB Account Opening"],
+    "Connect": [
+        "FNB Connect - SIM",
+        "FNB Connect - Phone - Under R300",
+        "FNB Connect - Phone - R300-R600",
+        "FNB Connect - Phone - R600+",
+    ],
+    "Insurance": [
+        "FNB Insurance - Car",
+        "FNB Insurance - Home",
+        "FNB Insurance - Funeral Cover",
+        "FNB Insurance - Life",
+        "FNB Insurance - Income Protector",
+        "FNB Insurance - Legacy Plan",
+    ],
+    "Loan": [
+        "FNB Loan - Personal Loan",
+        "FNB Loan - Credit Switch",
+        "FNB Loan - Building Loan",
+        "FNB Loan - Further Loan",
+        "FNB Loan - Refinance Loan",
+        "FNB Loan - Vehicle Finance Dealership",
+        "FNB Loan - Vehicle Finance Private",
+        "FNB Loan - Vehicle Finance Leisure",
+    ],
+}
+
+INTEREST_TO_FLOW: Dict[str, str] = {
+    interest: flow
+    for flow, interests in FLOW_REPRESENTATIVE_INTERESTS.items()
+    for interest in interests
+}
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
 
 
-def _safe_int(x: Any, default: int = 0) -> int:
+def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        if x is None:
+        if value is None:
             return default
-        return int(float(str(x)))
+        return int(float(str(value).replace(",", "").strip()))
     except Exception:
         return default
 
 
-def _is_blank(x: Any) -> bool:
-    return x is None or (isinstance(x, str) and not x.strip())
-
-
-def _calc_age(dob: Optional[str | date]) -> Optional[int]:
-    if not dob:
+def _parse_json_field(value: Any) -> Any:
+    """Parse a JSONB field that may arrive as string or already parsed."""
+    if value is None:
         return None
-    try:
-        if isinstance(dob, str):
-            dob_dt = date.fromisoformat(dob[:10])
-        else:
-            dob_dt = dob
-        today = date.today()
-        return today.year - dob_dt.year - ((today.month, today.day) < (dob_dt.month, dob_dt.day))
-    except Exception:
-        return None
-
-
-# -----------------------------
-# Supabase fetchers
-# -----------------------------
-def _get_latest_bureau_profile(customer_id: str) -> Optional[Dict[str, Any]]:
-    rows = (
-        supabase()
-        .table("bureau_profiles")
-        .select("*")
-        .eq("user_id", customer_id)
-        .eq("bureau", BUREAU)
-        .eq("status", "success")
-        .order("verified_at", desc=True)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    return rows[0] if rows else None
-
-
-def _get_existing_recommendation_row(customer_id: str) -> Optional[Dict[str, Any]]:
-    res = (
-        supabase()
-        .table("fnb_recommendations")
-        .select("*")
-        .eq("customer_id", customer_id)
-        .limit(1)
-        .execute()
-    )
-    return res.data[0] if res.data else None
-
-
-def _get_client(customer_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Robust select: DO NOT reference columns that may not exist (PostgREST fails whole query).
-    We only require id + primary_interest; DOB/income are optional.
-    """
-    select_attempts = [
-        "id,primary_interest,date_of_birth,monthly_income,income",
-        "id,primary_interest,date_of_birth",
-        "id,primary_interest",
-    ]
-
-    for sel in select_attempts:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
         try:
-            res = (
-                supabase()
-                .table("clients")
-                .select(sel)
-                .eq("id", customer_id)
-                .limit(1)
-                .execute()
-            )
-            return res.data[0] if res.data else None
-        except APIError as e:
-            msg = str(e)
-            if "42703" in msg or "does not exist" in msg:
-                continue
-            raise
+            return json.loads(value)
+        except Exception:
+            return None
     return None
 
 
-# -----------------------------
-# Catalog loading + caching
-# -----------------------------
-_catalog_cache: Optional[List[Dict[str, Any]]] = None
-_catalog_cache_ts: float = 0.0
-_CATALOG_TTL_SECONDS = 300  # refresh every 5 minutes
+# =============================================================================
+# Text cleaning
+# =============================================================================
+
+def _clean_text(text: str) -> str:
+    """Strip FNB branding and credit language from display text."""
+    replacements = [
+        ("FNB ", ""),
+        (" via FNB App", ""),
+        ("FNB App", "the app"),
+        ("FNB Connect", "Connect"),
+        ("FNB-to-FNB", "same-bank"),
+        ("credit check", "profile check"),
+        ("Credit check", "Profile check"),
+    ]
+    result = text
+    for old, new in replacements:
+        result = result.replace(old, new)
+    while "  " in result:
+        result = result.replace("  ", " ")
+    return result.strip()
 
 
-def _load_catalog() -> List[Dict[str, Any]]:
+# =============================================================================
+# Profile scoring  (0–8)
+# =============================================================================
+
+def _score_profile(
+    features: Dict[str, Any],
+    product: Dict[str, Any],
+) -> int:
     """
-    Build catalog from insurance_products + products (eligibility_rules/benefits).
+    Score client bureau profile. Range 0–8.
+    Score 0–3 → catalogue_item_1 (entry variant)
+    Score 4–8 → catalogue_item_2 (step-up variant)
     """
-    ins = (
-        supabase()
-        .table("insurance_products")
-        .select("id,name,product_code,product_type,description,underwriting_type,active")
-        .eq("active", True)
-        .execute()
-        .data
-        or []
-    )
+    score = 0
 
-    prod = (
-        supabase()
-        .table("products")
-        .select("id,product_code,product_name,eligibility_rules,benefits,option")
-        .execute()
-        .data
-        or []
-    )
-    by_code = {p["product_code"]: p for p in prod if p.get("product_code")}
+    effective_score = features.get("effective_credit_score")
+    if effective_score is not None:
+        cs = _safe_int(effective_score, 0)
+        if cs >= 700:
+            score += 3
+        elif cs >= 600:
+            score += 2
+        elif cs > 0:
+            score += 1
 
-    catalog: List[Dict[str, Any]] = []
-    for x in ins:
-        code = x.get("product_code")
-        p = by_code.get(code, {})
-        catalog.append(
-            {
-                "source_id": x.get("id"),
-                "product_code": code,
-                "name": x.get("name") or p.get("product_name") or code,
-                "product_type": x.get("product_type"),
-                "description": x.get("description"),
-                "underwriting_type": x.get("underwriting_type"),
-                "eligibility_rules": p.get("eligibility_rules") or {},
-                "benefits": p.get("benefits"),
-                "option": p.get("option"),
-            }
-        )
-    return catalog
+    if features.get("is_employed"):
+        score += 2
 
+    active_dirs = _safe_int(features.get("active_directorships"), 0)
+    if active_dirs > 0 or features.get("has_active_directorship"):
+        score += 1
 
-def load_catalog_cached() -> List[Dict[str, Any]]:
-    global _catalog_cache, _catalog_cache_ts
-    now = time.time()
-    if _catalog_cache and (now - _catalog_cache_ts) < _CATALOG_TTL_SECONDS:
-        return _catalog_cache
-    _catalog_cache = _load_catalog()
-    _catalog_cache_ts = now
-    return _catalog_cache
+    adverse = _safe_int(features.get("adverse_accounts"), 0)
+    safps   = features.get("safps_status", "unknown")
+    if adverse == 0 and safps != "listed":
+        score += 1
 
-
-# -----------------------------
-# Flow classification (FIXED)
-# -----------------------------
-def _classify_flow(item: Dict[str, Any]) -> str:
-    code = (item.get("product_code") or "").upper()
-    pt = (item.get("product_type") or "").lower()
-    name = (item.get("name") or "").lower()
-
-    # Account
-    if code in {"FNB_EASY_SMART", "FNB_ASPIRE", "FNB_FUSION_ASPIRE"} or "banking account" in pt or "account" in pt:
-        return "Account"
-
-    # Connect
-    if code.startswith("FNB_CONNECT") or "sim" in name or "telecom" in pt or "device contract" in pt:
-        return "Connect"
-
-    # Loan / Credit
-    if code in {"FNB_PERSONAL_LOAN", "FNB_CREDIT_CARD", "FNB_OVERDRAFT"} or "loan" in pt or "credit card" in pt:
-        return "Loan"
-
-    return "Insurance"
-
-
-# -----------------------------
-# Bureau signals (user-specific)
-# -----------------------------
-def _bureau_signals(bp: Dict[str, Any]) -> Dict[str, Any]:
-    presage = _safe_int(bp.get("presage_score"), 0)
-    nlr = _safe_int(bp.get("nlr_score"), 0)
-    credit_score = presage if presage > 0 else (nlr if nlr > 0 else None)
-
-    employed = bool((bp.get("current_employer") or "").strip())
-    home_affairs_verified = str(bp.get("home_affairs_verified_yn") or "").strip().lower() in ("yes", "true", "1")
-    deceased = str(bp.get("home_affairs_deceased_status") or "").strip().lower() in ("yes", "true", "1")
-    safps = str(bp.get("safps_listing_yn") or "").strip().lower() in ("yes", "true", "1")
-
-    return {
-        "credit_score": credit_score,
-        "employed": employed,
-        "home_affairs_verified": home_affairs_verified,
-        "deceased": deceased,
-        "safps": safps,
-    }
-
-
-# -----------------------------
-# Eligibility + scoring
-# -----------------------------
-def _eligibility_passes(
-    rules: Dict[str, Any],
-    *,
-    age: Optional[int],
-    income: Optional[int],
-    signals: Dict[str, Any],
-) -> Tuple[bool, str]:
-    if not isinstance(rules, dict):
-        rules = {}
-
-    if signals.get("deceased") is True:
-        return False, "Not eligible"
-
-    min_age = rules.get("min_age")
-    if min_age is not None and age is not None and age < int(min_age):
-        return False, "Not eligible"
-
-    min_income = rules.get("min_income")
-    if min_income is not None and income is not None and income < int(min_income):
-        return False, "Not eligible"
-
-    if rules.get("employment_required") is True and not signals.get("employed"):
-        return False, "Not eligible"
-
-    if rules.get("credit_check") is True:
-        min_score = rules.get("min_credit_score")
-        cs = signals.get("credit_score")
-        if min_score is not None:
-            if cs is None:
-                return False, "Not eligible"
-            if int(cs) < int(min_score):
-                return False, "Not eligible"
-
-    return True, "Eligible"
-
-
-def _score_item(
-    item: Dict[str, Any],
-    *,
-    age: Optional[int],
-    income: Optional[int],
-    signals: Dict[str, Any],
-    primary_interest: Optional[str],
-) -> float:
-    rules = item.get("eligibility_rules") or {}
-    ok, _ = _eligibility_passes(rules, age=age, income=income, signals=signals)
-    if not ok:
-        return -999.0
-
-    flow = _classify_flow(item)
-    score = 0.0
-
-    cs = signals.get("credit_score")
-    employed = signals.get("employed")
-    verified = signals.get("home_affairs_verified")
-    safps = signals.get("safps")
-
-    # Baseline user signals
-    if verified:
-        score += 2.0
-    if employed:
-        score += 2.0
-    if cs is not None:
-        score += float(cs) / 150.0  # 600->4.0, 750->5.0
-
-    # Penalize fraud listing
-    if safps:
-        score -= 8.0
-
-    # Flow weighting
-    credit_required = rules.get("credit_check") is True
-    min_score = rules.get("min_credit_score")
-
-    if flow == "Loan":
-        # Must have score; heavily boosted
-        if cs is None:
-            return -999.0
-        score += 6.0
-        if min_score and cs >= int(min_score):
-            score += 2.0
-        if employed:
-            score += 2.0
-
-    elif flow == "Account":
-        # Prefer easy onboarding (no credit check)
-        if not credit_required:
-            score += 3.0
-        else:
-            score += 1.0 if cs is not None else -1.5
-
-    elif flow == "Connect":
-        # Prefer prepaid when score missing; contract when score exists
-        name = (item.get("name") or "").lower()
-        code = (item.get("product_code") or "").lower()
-        is_prepaid = ("prepaid" in name) or ("prepaid" in code)
-        if is_prepaid:
-            score += 3.0 if cs is None else 1.0
-        else:
-            score += 3.0 if cs is not None else 0.5
-
-    else:
-        # Insurance/legal/health
-        uw = (item.get("underwriting_type") or "").lower()
-        if uw in ("none", "no_medicals"):
-            score += 2.0
-        elif uw in ("risk_based", "medical_scheme_required"):
-            score += 1.0
-
-    # Primary interest soft boost (doesn't dominate)
-    if primary_interest:
-        pi = primary_interest.lower().strip()
-        if pi and pi in (item.get("name") or "").lower():
-            score += 2.5
-        if pi and pi in (item.get("product_type") or "").lower():
-            score += 1.0
+    if product.get("existing_account_required") and features.get("has_fnb_account"):
+        score += 1
 
     return score
 
 
-def _pick_top2_unique(arr: List[Tuple[float, Dict[str, Any]]]) -> List[Tuple[float, Dict[str, Any]]]:
-    arr = sorted(arr, key=lambda x: x[0], reverse=True)
-    chosen: List[Tuple[float, Dict[str, Any]]] = []
-    seen = set()
+# =============================================================================
+# Catalogue item selection
+# =============================================================================
 
-    for score, item in arr:
-        if score <= -999:
-            continue
-        code = (item.get("product_code") or item.get("name") or "").strip().lower()
-        if not code or code in seen:
-            continue
-        chosen.append((score, item))
-        seen.add(code)
-        if len(chosen) == 2:
-            break
-    return chosen
-
-
-# -----------------------------
-# Reasons (benefit-driven + light personalisation)
-# -----------------------------
-def _benefit_reason(item: Dict[str, Any], flow: str, signals: Dict[str, Any]) -> str:
+def _select_catalogue_item(
+    product: Dict[str, Any],
+    features: Dict[str, Any],
+    offset: int = 0,
+) -> Optional[Dict[str, Any]]:
     """
-    Return ONLY product benefits (preferred) or product description (fallback).
-    No user/bureau signals appended.
+    Select catalogue_item_1 or catalogue_item_2 based on profile score.
+
+    offset=0 (best):      score 0–3 → item_1,  score 4–8 → item_2
+    offset=1 (next best): always the OTHER item from what offset=0 selected
     """
-    benefits = item.get("benefits")
-    desc = (item.get("description") or "").strip()
+    score = _score_profile(features, product)
 
-    # benefits in your `products` table may be:
-    # - a Python list
-    # - a JSON string
-    # - a plain string
-    if isinstance(benefits, list) and benefits:
-        return ", ".join([str(b) for b in benefits[:3]]).strip()
+    if offset == 0:
+        primary_key = "catalogue_item_1" if score <= 3 else "catalogue_item_2"
+        fallback_key = "catalogue_item_2" if score <= 3 else "catalogue_item_1"
+    else:
+        primary_key = "catalogue_item_2" if score <= 3 else "catalogue_item_1"
+        fallback_key = "catalogue_item_1" if score <= 3 else "catalogue_item_2"
 
-    if isinstance(benefits, str) and benefits.strip():
-        return benefits.strip()
+    item = _parse_json_field(product.get(primary_key))
+    if isinstance(item, dict):
+        return item
 
-    return desc or "Good match for your needs"
-    return base
-
-
-def _apply_flow_if_missing(
-    update: Dict[str, Any],
-    existing: Optional[Dict[str, Any]],
-    flow: str,
-    best_item: Dict[str, Any],
-    best_score: float,
-    nxt_item: Optional[Dict[str, Any]],
-    nxt_score: Optional[float],
-    signals: Dict[str, Any],
-) -> None:
-    def field(name: str) -> Any:
-        return existing.get(name) if existing else None
-
-    best_reason = _benefit_reason(best_item, flow, signals)
-    nxt_reason = _benefit_reason(nxt_item, flow, signals) if nxt_item else None
-
-    if flow == "Account":
-        if _is_blank(field("account_rec_1_name")):
-            update["account_rec_1_name"] = best_item["name"]
-            update["account_rec_1_reason"] = best_reason
-        if nxt_item and _is_blank(field("account_rec_2_name")):
-            update["account_rec_2_name"] = nxt_item["name"]
-            update["account_rec_2_reason"] = nxt_reason
-
-    elif flow == "Connect":
-        if _is_blank(field("connect_rec_1_name")):
-            update["connect_rec_1_name"] = best_item["name"]
-            update["connect_rec_1_reason"] = best_reason
-        if nxt_item and _is_blank(field("connect_rec_2_name")):
-            update["connect_rec_2_name"] = nxt_item["name"]
-            update["connect_rec_2_reason"] = nxt_reason
-
-    elif flow == "Insurance":
-        if _is_blank(field("insurance_rec_1_name")):
-            update["insurance_rec_1_name"] = best_item["name"]
-            update["insurance_rec_1_reason"] = best_reason
-        if nxt_item and _is_blank(field("insurance_rec_2_name")):
-            update["insurance_rec_2_name"] = nxt_item["name"]
-            update["insurance_rec_2_reason"] = nxt_reason
-
-    elif flow == "Loan":
-        if _is_blank(field("loan_rec_1_name")):
-            update["loan_rec_1_name"] = best_item["name"]
-            update["loan_rec_1_reason"] = best_reason
-        if nxt_item and _is_blank(field("loan_rec_2_name")):
-            update["loan_rec_2_name"] = nxt_item["name"]
-            update["loan_rec_2_reason"] = nxt_reason
+    item = _parse_json_field(product.get(fallback_key))
+    return item if isinstance(item, dict) else None
 
 
-# -----------------------------
-# Main public function
-# -----------------------------
-def generate_recommendation_for_customer(customer_id: str, catalog: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def _build_reason_from_catalogue_item(item: Dict[str, Any]) -> str:
     """
-    - Requires bureau data (XDS) success
-    - Uses catalog from insurance_products (+ products rules)
-    - Picks best+next best per flow (Account/Connect/Insurance/Loan)
-    - Inserts if none exists; otherwise updates only missing fields (no overwrites)
+    Build reason string from highlights. Appends amount_range and
+    example_repayment where present. No URLs, no FNB branding.
     """
-    bp = _get_latest_bureau_profile(customer_id)
-    if not bp:
-        return {"status": "skipped", "reason": "no_bureau_data"}
+    parts: List[str] = []
 
-    signals = _bureau_signals(bp)
+    highlights = item.get("highlights") or []
+    if isinstance(highlights, list):
+        cleaned = [
+            _clean_text(h)
+            for h in highlights
+            if h and "http" not in str(h).lower()
+        ]
+        if cleaned:
+            parts.append(" | ".join(cleaned))
 
-    client = _get_client(customer_id) or {}
-    primary_interest = (client.get("primary_interest") or "").strip() or None
+    amount_range = item.get("amount_range")
+    if amount_range:
+        parts.append(f"Amount: {_clean_text(str(amount_range))}")
 
-    dob = client.get("date_of_birth")
-    age = _calc_age(dob)
+    example = item.get("example_repayment")
+    if example and "http" not in str(example).lower():
+        parts.append(_clean_text(str(example)))
 
-    income_val = client.get("monthly_income") or client.get("income")
-    income = _safe_int(income_val, 0) if income_val is not None else None
+    return " — ".join(parts) if parts else ""
 
-    existing = _get_existing_recommendation_row(customer_id)
 
-    catalog = catalog or load_catalog_cached()
+def _extract_product_info(
+    catalogue_item: Optional[Dict[str, Any]],
+    product: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build the product info dict from a selected catalogue item.
 
-    # score and group by flow
-    by_flow: Dict[str, List[Tuple[float, Dict[str, Any]]]] = {"Account": [], "Connect": [], "Insurance": [], "Loan": []}
-    for item in catalog:
-        flow = _classify_flow(item)
-        score = _score_item(item, age=age, income=income, signals=signals, primary_interest=primary_interest)
-        by_flow.setdefault(flow, []).append((score, item))
+    product_name → from catalogue item's product_name / name / plan_name
+    reason       → from catalogue item's highlights + amount fields
+    product_code → from the master product record
+    tier         → from the master product record
 
-    # top2 per flow (deduped)
-    picks: Dict[str, Tuple[Tuple[float, Dict[str, Any]], Optional[Tuple[float, Dict[str, Any]]]]] = {}
-    for flow, arr in by_flow.items():
-        top = _pick_top2_unique(arr)
-        if not top:
-            continue
-        best = top[0]
-        nxt = top[1] if len(top) > 1 else None
-        picks[flow] = (best, nxt)
+    The master product_name is NEVER used for display.
+    """
+    if catalogue_item:
+        raw_name = (
+            catalogue_item.get("product_name")
+            or catalogue_item.get("name")
+            or catalogue_item.get("plan_name")
+            or ""
+        )
+        reason = _build_reason_from_catalogue_item(catalogue_item)
+    else:
+        raw_name = ""
+        benefits = product.get("benefits")
+        if isinstance(benefits, list):
+            reason = " | ".join([_clean_text(b) for b in benefits[:4] if b])
+        elif isinstance(benefits, str):
+            try:
+                bl     = json.loads(benefits)
+                reason = " | ".join([_clean_text(b) for b in bl[:4] if b])
+            except Exception:
+                reason = _clean_text(benefits)
+        else:
+            reason = _clean_text(product.get("description", ""))
 
-    if not picks:
-        return {"status": "skipped", "reason": "no_eligible_products"}
+    return {
+        "product_code": product.get("product_code"),
+        "product_name": _clean_text(raw_name),
+        "tier":         product.get("tier"),
+        "reason":       reason,
+    }
 
-    # Build option_recommendations + generated_config_ids (optional columns)
-    option_recos: Dict[str, Any] = {}
-    gen_codes: List[str] = []
 
-    for flow, (best, nxt) in picks.items():
-        best_score, best_item = best
-        nxt_score, nxt_item = (nxt if nxt else (None, None))
+# =============================================================================
+# DB helpers
+# =============================================================================
 
-        gen_codes.append(best_item.get("product_code") or best_item.get("name") or "")
-        if nxt_item:
-            gen_codes.append(nxt_item.get("product_code") or nxt_item.get("name") or "")
-
-        option_recos[flow] = {
-            "best": {
-                "product_code": best_item.get("product_code"),
-                "name": best_item.get("name"),
-                "reason": _benefit_reason(best_item, flow, signals),
-                "score": round(best_score, 2),
-            },
-            "next_best": (
-                {
-                    "product_code": nxt_item.get("product_code"),
-                    "name": nxt_item.get("name"),
-                    "reason": _benefit_reason(nxt_item, flow, signals),
-                    "score": round(float(nxt_score), 2) if nxt_score is not None else None,
-                }
-                if nxt_item
-                else None
-            ),
-        }
-
-    # Insert new row
-    if not existing:
-        rec_id = f"rec-{uuid.uuid4()}"
-        row: Dict[str, Any] = {
-            "id": rec_id,
-            "customer_id": customer_id,
-            "generated_at": _now_iso(),
-            "enrichment_complete": True,
-            "generated_options": [],  # keep your existing column
-        }
-
-        # Optional columns if you added them
-        if "bureau_profile_id" in (supabase().table("fnb_recommendations").select("bureau_profile_id").limit(1).execute().data[0] if False else {}):
-            # (we don't actually want to query schema here; leaving for clarity)
-            pass
-
-        # Fill recommendations for all flows
-        for flow, (best, nxt) in picks.items():
-            best_score, best_item = best
-            nxt_score, nxt_item = (nxt if nxt else (None, None))
-            _apply_flow_if_missing(row, None, flow, best_item, best_score, nxt_item, nxt_score, signals)
-
-        # Add optional columns if present in table (safe: try update after insert)
-        supabase().table("fnb_recommendations").insert(row).execute()
-
-        # Best-effort update of new columns (won't break if columns not present)
-        try:
-            supabase().table("fnb_recommendations").update(
-                {
-                    "bureau_profile_id": bp.get("id"),
-                    "option_recommendations": option_recos,
-                    "generated_config_ids": [],  # keep as int[] later when you map to config IDs
-                }
-            ).eq("customer_id", customer_id).execute()
-        except Exception:
-            pass
-
-        return {"status": "success", "mode": "inserted", "customer_id": customer_id, "recommendation_id": rec_id}
-
-    # Update existing row: ONLY fill missing fields
-    update: Dict[str, Any] = {"enrichment_complete": True}
-    before_keys = set(update.keys())
-
-    for flow, (best, nxt) in picks.items():
-        best_score, best_item = best
-        nxt_score, nxt_item = (nxt if nxt else (None, None))
-        _apply_flow_if_missing(update, existing, flow, best_item, best_score, nxt_item, nxt_score, signals)
-
-    # also store option_recommendations if column exists AND not already present/empty
+def _get_client(client_id: str) -> Optional[Dict[str, Any]]:
     try:
-        # if existing option_recommendations is empty, fill it once
-        if "option_recommendations" in existing and (existing.get("option_recommendations") in (None, {}, "{}", "")):
-            update["option_recommendations"] = option_recos
+        res = (
+            supabase()
+            .table("clients")
+            .select("id, primary_interest, date_of_birth, age")
+            .eq("id", client_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
     except Exception:
-        pass
+        return None
 
-    if set(update.keys()) == before_keys:
-        return {"status": "skipped", "reason": "already_complete", "customer_id": customer_id}
 
-    supabase().table("fnb_recommendations").update(update).eq("customer_id", customer_id).execute()
-    return {"status": "success", "mode": "updated_missing", "customer_id": customer_id}
+def _get_existing_recommendation(client_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = (
+            supabase()
+            .table("fnb_recommendations")
+            .select(
+                "customer_id, primary_interest_snapshot, " +
+                ", ".join(
+                    f"{p}best_product_name"
+                    for p in INTEREST_COLUMN_PREFIX.values()
+                )
+            )
+            .eq("customer_id", client_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception:
+        return None
+
+
+def _get_products_for_interest(
+    primary_interest: str,
+) -> Dict[int, Dict[str, Any]]:
+    """Load all active tiers for a primary_interest. Returns {tier: product}."""
+    try:
+        res = (
+            supabase()
+            .table("fnb_product_master")
+            .select("*")
+            .eq("primary_interest", primary_interest)
+            .eq("is_active", True)
+            .order("tier")
+            .execute()
+        )
+        return {row["tier"]: row for row in (res.data or [])}
+    except Exception:
+        return {}
+
+
+# =============================================================================
+# Eligibility checks
+# =============================================================================
+
+def _passes_hard_gates(
+    product: Dict[str, Any],
+    features: Dict[str, Any],
+    client_age: Optional[int],
+) -> bool:
+    if features.get("is_deceased") is True:
+        return False
+    min_age = _safe_int(product.get("min_age"), 18)
+    age     = client_age or features.get("age") or 0
+    if age > 0 and age < min_age:
+        return False
+    return True
+
+
+def _passes_credit_gates(
+    product: Dict[str, Any],
+    features: Dict[str, Any],
+    rec_level: int,
+) -> bool:
+    credit_check     = product.get("credit_check", False)
+    employment_req   = product.get("employment_required", False)
+    min_credit_score = product.get("min_credit_score")
+    effective_score  = features.get("effective_credit_score")
+    is_employed      = features.get("is_employed", False)
+    has_active_dir   = (
+        features.get("has_active_directorship", False)
+        or features.get("active_directorships", 0) > 0
+    )
+    safps = features.get("safps_status", "unknown")
+
+    if safps == "listed" and credit_check:
+        return False
+
+    if rec_level == 1:
+        if credit_check and effective_score is None:
+            return False
+        if credit_check and min_credit_score and effective_score is not None:
+            if effective_score < min_credit_score:
+                return False
+        if employment_req and not is_employed:
+            return False
+        return True
+
+    if rec_level == 2:
+        if employment_req and not (is_employed or has_active_dir):
+            return False
+        return True
+
+    if rec_level == 3:
+        if credit_check and effective_score is not None and min_credit_score:
+            if effective_score < min_credit_score:
+                return False
+        return True
+
+    if rec_level == 4:
+        if credit_check or employment_req:
+            return False
+        return True
+
+    return True
+
+
+# =============================================================================
+# Core recommendation logic — per interest
+# =============================================================================
+
+def _recommend_for_interest(
+    primary_interest: str,
+    features: Dict[str, Any],
+    client_age: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Produce best + next_best for one primary_interest.
+
+    tier 1 product → BEST   (entry, most accessible)
+    tier 2 product → NEXT BEST  (step-up within same category)
+
+    Catalogue item within each tier selected by profile score:
+      score 0–3 → catalogue_item_1,  score 4–8 → catalogue_item_2
+
+    If tier 1 fails eligibility but tier 2 passes → tier 2 promoted to BEST.
+    If both fail → best and next_best are None for this interest.
+    """
+    rec_level = _safe_int(features.get("recommendation_level"), 4)
+    products  = _get_products_for_interest(primary_interest)
+
+    empty = {
+        "primary_interest": primary_interest,
+        "flow":             INTEREST_TO_FLOW.get(primary_interest),
+        "best":             None,
+        "next_best":        None,
+    }
+
+    if not products:
+        return empty
+
+    tier1 = products.get(1)
+    tier2 = products.get(2)
+
+    tier1_ok = (
+        tier1 is not None
+        and _passes_hard_gates(tier1, features, client_age)
+        and _passes_credit_gates(tier1, features, rec_level)
+    )
+    tier2_ok = (
+        tier2 is not None
+        and _passes_hard_gates(tier2, features, client_age)
+        and _passes_credit_gates(tier2, features, rec_level)
+    )
+
+    best      = None
+    next_best = None
+
+    if tier1_ok:
+        best = _extract_product_info(
+            _select_catalogue_item(tier1, features, offset=0), tier1
+        )
+    if tier2_ok:
+        next_best = _extract_product_info(
+            _select_catalogue_item(tier2, features, offset=0), tier2
+        )
+
+    # Tier 1 failed but tier 2 passed — promote tier 2 to best
+    if best is None and next_best is not None:
+        best      = next_best
+        next_best = None
+
+    return {
+        "primary_interest": primary_interest,
+        "flow":             INTEREST_TO_FLOW.get(primary_interest),
+        "best":             best,
+        "next_best":        next_best,
+    }
+
+
+# =============================================================================
+# Run ALL 19 interests — primary interest always first
+# =============================================================================
+
+def _recommend_all_interests(
+    primary_interest: str,
+    features: Dict[str, Any],
+    client_age: Optional[int],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Run _recommend_for_interest for all 19 interests.
+    Primary interest is always processed first, then the remaining 18.
+    Returns { interest_string: result_dict }.
+    """
+    results: Dict[str, Dict[str, Any]] = {}
+
+    results[primary_interest] = _recommend_for_interest(
+        primary_interest, features, client_age
+    )
+
+    for interest in ALL_INTERESTS:
+        if interest == primary_interest:
+            continue
+        results[interest] = _recommend_for_interest(interest, features, client_age)
+
+    return results
+
+
+# =============================================================================
+# Change detection + gap detection
+# =============================================================================
+
+def _primary_interest_changed(
+    existing: Optional[Dict[str, Any]],
+    current_primary_interest: str,
+) -> bool:
+    if not existing:
+        return True
+    stored = existing.get("primary_interest_snapshot") or ""
+    return stored.strip().lower() != current_primary_interest.strip().lower()
+
+
+def _has_null_product_columns(rec: Dict[str, Any]) -> bool:
+    """
+    Returns True if ANY of the 19 best_product_name columns is null —
+    meaning the row has gaps that need filling.
+    """
+    for prefix in INTEREST_COLUMN_PREFIX.values():
+        if rec.get(f"{prefix}best_product_name") is None:
+            return True
+    return False
+
+
+# =============================================================================
+# Row builder
+# Writes all 152 per-product columns + option_recommendations JSONB.
+# NO legacy flow-level columns — they do not exist in the current schema.
+# =============================================================================
+
+def _build_recommendation_row(
+    client_id: str,
+    primary_interest: str,
+    all_interest_results: Dict[str, Dict[str, Any]],
+    bureau_profile_id: str,
+) -> Dict[str, Any]:
+    """
+    Build the complete upsert row for fnb_recommendations.
+
+    19 interests × 8 columns = 152 per-product columns written.
+    Columns written per interest:
+      {prefix}best_product_code
+      {prefix}best_product_name
+      {prefix}best_product_tier
+      {prefix}best_product_reason
+      {prefix}next_best_product_code
+      {prefix}next_best_product_name
+      {prefix}next_best_product_tier
+      {prefix}next_best_product_reason
+    """
+    product_columns: Dict[str, Any] = {}
+
+    for interest, prefix in INTEREST_COLUMN_PREFIX.items():
+        result    = all_interest_results.get(interest, {})
+        best      = result.get("best") or {}
+        next_best = result.get("next_best") or {}
+
+        product_columns[f"{prefix}best_product_code"]        = best.get("product_code")
+        product_columns[f"{prefix}best_product_name"]        = best.get("product_name")
+        product_columns[f"{prefix}best_product_tier"]        = best.get("tier")
+        product_columns[f"{prefix}best_product_reason"]      = best.get("reason")
+        product_columns[f"{prefix}next_best_product_code"]   = next_best.get("product_code")
+        product_columns[f"{prefix}next_best_product_name"]   = next_best.get("product_name")
+        product_columns[f"{prefix}next_best_product_tier"]   = next_best.get("tier")
+        product_columns[f"{prefix}next_best_product_reason"] = next_best.get("reason")
+
+    option_recommendations: Dict[str, Any] = {
+        interest: {
+            "best":      all_interest_results.get(interest, {}).get("best"),
+            "next_best": all_interest_results.get(interest, {}).get("next_best"),
+        }
+        for interest in ALL_INTERESTS
+    }
+
+    row: Dict[str, Any] = {
+        "customer_id":               client_id,
+        "generated_at":              _now_iso(),
+        "enrichment_complete":       True,
+        "bureau_profile_id":         bureau_profile_id,
+        "primary_interest_snapshot": primary_interest,
+        "updated_at":                _now_iso(),
+        "option_recommendations":    option_recommendations,
+        **product_columns,
+    }
+
+    return row
+
+
+# =============================================================================
+# Main entry point
+# =============================================================================
+
+def generate_recommendation_for_customer(
+    customer_id: str,
+) -> Dict[str, Any]:
+    """
+    Full recommendation run for one customer.
+
+      1. Load client + primary_interest from clients table
+      2. Ensure bureau_features exist (extract if missing)
+      3. Skip if primary_interest unchanged AND row is already complete
+      4. Run primary interest FIRST, then all 18 remaining interests
+      5. Write all 152 per-product columns in a single upsert
+    """
+
+    # 1. Load client — must exist in clients table
+    client = _get_client(customer_id)
+    if not client:
+        return {"status": "skipped", "reason": "client_not_found"}
+
+    primary_interest = (client.get("primary_interest") or "").strip()
+    if not primary_interest:
+        return {"status": "skipped", "reason": "no_primary_interest_set"}
+
+    client_age = _safe_int(client.get("age"), 0) or None
+
+    # 2. Get bureau features — extract if missing
+    features = get_latest_bureau_features(customer_id)
+
+    if not features:
+        try:
+            bp_res = (
+                supabase()
+                .table("bureau_profiles")
+                .select("id")
+                .eq("user_id", customer_id)
+                .eq("status", "success")
+                .order("verified_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if bp_res.data:
+                bp_id          = bp_res.data[0]["id"]
+                extract_result = extract_bureau_features(bp_id)
+                if extract_result["status"] != "success":
+                    return {
+                        "status": "skipped",
+                        "reason": f"bureau_extraction_failed: {extract_result.get('reason')}",
+                    }
+                features = get_latest_bureau_features(customer_id)
+        except Exception as e:
+            return {"status": "skipped", "reason": f"bureau_features_load_error: {e}"}
+
+    if not features:
+        return {"status": "skipped", "reason": "no_bureau_features_available"}
+
+    if features.get("is_deceased") is True:
+        return {"status": "skipped", "reason": "client_is_deceased"}
+
+    bureau_profile_id = features.get("bureau_profile_id", "")
+
+    # 3. Check existing row — skip only if unchanged AND complete
+    existing         = _get_existing_recommendation(customer_id)
+    interest_changed = _primary_interest_changed(existing, primary_interest)
+    has_gaps         = existing is not None and _has_null_product_columns(existing)
+
+    if existing and not interest_changed and not has_gaps:
+        return {
+            "status":           "success",
+            "mode":             "no_change",
+            "customer_id":      customer_id,
+            "primary_interest": primary_interest,
+            "message":          "Recommendation is current and complete",
+        }
+
+    # 4. Run all 19 interests — primary interest first
+    all_interest_results = _recommend_all_interests(
+        primary_interest, features, client_age
+    )
+
+    primary_result = all_interest_results.get(primary_interest, {})
+    if not primary_result.get("best"):
+        return {
+            "status": "skipped",
+            "reason": f"no_eligible_products_for_interest: {primary_interest}",
+        }
+
+    # 5. Build and upsert
+    row = _build_recommendation_row(
+        client_id=customer_id,
+        primary_interest=primary_interest,
+        all_interest_results=all_interest_results,
+        bureau_profile_id=bureau_profile_id,
+    )
+
+    try:
+        if existing:
+            (
+                supabase()
+                .table("fnb_recommendations")
+                .update(row)
+                .eq("customer_id", customer_id)
+                .execute()
+            )
+            mode = "updated"
+        else:
+            row["id"]         = f"rec-{uuid.uuid4()}"
+            row["created_at"] = _now_iso()
+            (
+                supabase()
+                .table("fnb_recommendations")
+                .insert(row)
+                .execute()
+            )
+            mode = "inserted"
+
+    except APIError as e:
+        return {"status": "error", "reason": f"upsert_failed: {e}"}
+
+    return {
+        "status":            "success",
+        "mode":              mode,
+        "customer_id":       customer_id,
+        "primary_interest":  primary_interest,
+        "interest_changed":  interest_changed,
+        "gap_filled":        has_gaps and not interest_changed,
+        "flow":              primary_result.get("flow"),
+        "best_product":      primary_result.get("best"),
+        "next_best_product": primary_result.get("next_best"),
+    }
+
+
+# =============================================================================
+# Batch runner
+# Guarantees every client in clients table has a complete recommendation row
+# =============================================================================
+
+def _has_null_product_columns(rec: Dict[str, Any]) -> bool:
+    """
+    Returns True if ANY of the 19 best_product_name columns is null —
+    meaning this row has gaps that need to be filled.
+    """
+    for prefix in INTEREST_COLUMN_PREFIX.values():
+        if rec.get(f"{prefix}best_product_name") is None:
+            return True
+    return False
+
+
+def generate_recommendations_for_all_pending() -> Dict[str, Any]:
+    """
+    Ensures EVERY client in the clients table has a complete recommendation row.
+
+    Runs for a client when ANY of the following is true:
+      1. No row exists in fnb_recommendations yet
+      2. primary_interest has changed since last recommendation
+      3. Existing row has null values in any per-product column (gap-fill)
+
+    Clients without a primary_interest are skipped.
+    Clients not in the clients table are never processed.
+    """
+    try:
+        clients = (
+            supabase()
+            .table("clients")
+            .select("id, primary_interest")
+            .not_.is_("primary_interest", "null")
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        return {"status": "error", "reason": f"Could not load clients: {e}"}
+
+    # Load all existing rows in one query — keyed by customer_id for O(1) lookup
+    try:
+        existing_rows_list = (
+            supabase()
+            .table("fnb_recommendations")
+            .select(
+                "customer_id, primary_interest_snapshot, " +
+                ", ".join(
+                    f"{p}best_product_name"
+                    for p in INTEREST_COLUMN_PREFIX.values()
+                )
+            )
+            .execute()
+            .data
+            or []
+        )
+        existing_map: Dict[str, Dict[str, Any]] = {
+            r["customer_id"]: r for r in existing_rows_list
+        }
+    except Exception as e:
+        return {"status": "error", "reason": f"Could not load existing recommendations: {e}"}
+
+    results = {
+        "inserted":   0,
+        "updated":    0,
+        "gap_filled": 0,
+        "no_change":  0,
+        "skipped":    0,
+        "errors":     0,
+        "total":      len(clients),
+    }
+
+    for c in clients:
+        cid              = c["id"]
+        primary_interest = (c.get("primary_interest") or "").strip()
+
+        if not primary_interest:
+            results["skipped"] += 1
+            continue
+
+        existing = existing_map.get(cid)
+
+        no_row           = existing is None
+        interest_changed = (
+            existing is not None
+            and (existing.get("primary_interest_snapshot") or "").strip().lower()
+                != primary_interest.strip().lower()
+        )
+        has_gaps = existing is not None and _has_null_product_columns(existing)
+
+        if not no_row and not interest_changed and not has_gaps:
+            results["no_change"] += 1
+            continue
+
+        outcome = generate_recommendation_for_customer(cid)
+        mode    = outcome.get("mode") or outcome.get("status")
+
+        if mode == "inserted":
+            results["inserted"] += 1
+        elif mode == "updated":
+            if has_gaps and not interest_changed:
+                results["gap_filled"] += 1
+            else:
+                results["updated"] += 1
+        elif mode == "no_change":
+            results["no_change"] += 1
+        elif outcome.get("status") == "skipped":
+            results["skipped"] += 1
+        else:
+            results["errors"] += 1
+
+    return {"status": "success", **results}
