@@ -22,6 +22,11 @@ class Settings:
     POLL_INTERVAL_SECONDS = int(os.getenv("BUREAU_POLL_INTERVAL_SECONDS", "30"))
     BATCH_SIZE = int(os.getenv("BUREAU_BATCH_SIZE", "20"))
     FRESHNESS_DAYS = int(os.getenv("BUREAU_FRESHNESS_DAYS", "30"))
+    
+    RECO_POLL_INTERVAL_SECONDS: int = 30
+    RECO_BATCH_SIZE: int = 50
+    RECO_CONCURRENCY: int = 10
+
 
 settings = Settings()
 

@@ -10,32 +10,47 @@
 #
 #   Engine shows tier 1 as BEST RECOMMENDATION.
 #   Engine shows tier 2 as NEXT BEST RECOMMENDATION.
-#   If client qualifies for NEITHER tier → columns remain null for that interest.
+#   If client qualifies for NEITHER tier → best reason carries sorry message,
+#   next best remains null.
 #
-# CATALOGUE ITEM SELECTION:
-#   Each tier has catalogue_item_1 and catalogue_item_2.
-#   Client profile score (0–8) determines which item is selected:
-#     Score 0–3  → catalogue_item_1  (entry variant)
-#     Score 4–8  → catalogue_item_2  (step-up variant)
+# CATALOGUE ITEM SELECTION (rank-based):
+#   Each product has a catalogue_items array, each item having a "rank" field.
+#   Rank 1 is always the floor/entry item.
+#   Rank 2 is the minimum rank to receive a Best recommendation.
+#
+#   Profile score (0–5) determines which rank is selected:
+#     Score 0 → no qualifying product (sorry message on best_reason, next_best null)
+#     Score 1 → Best = Rank 2,  Next Best = Rank 1
+#     Score 2 → Best = Rank 3,  Next Best = Rank 2
+#     Score 3 → Best = Rank 4,  Next Best = Rank 3
+#     Score 4 → Best = Rank 5,  Next Best = Rank 4
+#     Score 5 → Best = Rank 6,  Next Best = Rank 5
+#
+#   Capping: if score exceeds available ranks, client receives the highest
+#   available rank. Next Best is always one rank below Best.
+#
 #   Score signals:
-#     credit_score >= 700   +3
-#     credit_score 600–699  +2
-#     credit_score < 600    +1
-#     is_employed           +2
+#     credit_score >= 700   +2
+#     credit_score 600–699  +1
+#     credit_score < 600    +0
+#     is_employed           +1
 #     active_director       +1
 #     no adverse listings   +1
-#     existing FNB account  +1
-#   Max = 8
+#   Max = 5
 #
 # REASON FIELD:
 #   Built from catalogue item highlights only.
 #   No URLs, no "FNB" prefix, no "credit" language.
 #   amount_range and example_repayment appended where present.
 #
+# SORRY MESSAGE (score = 0):
+#   best_product_name  → null
+#   best_reason        → "Sorry, I couldn't find any qualifying products
+#                         that meet your profile at the moment."
+#   next_best fields   → all null
+#
 # SCHEMA:
 #   Writes to fnb_recommendations — 19 interests × 8 columns = 152 columns.
-#   No legacy flow-level columns (account_rec_*, connect_rec_* etc.) —
-#   those have been removed from the schema.
 #
 # INTEREST → COLUMN PREFIX MAP:
 #   FNB Account Opening                    → acct_
@@ -74,6 +89,9 @@ from app.services.bureau_extractor import (
     get_latest_bureau_features,
 )
 
+SORRY_MESSAGE = (
+    "Sorry, I couldn't find any qualifying products that meet your profile at the moment."
+)
 
 # =============================================================================
 # Interest → column prefix  (matches fnb_recommendations schema exactly)
@@ -194,17 +212,32 @@ def _clean_text(text: str) -> str:
 
 
 # =============================================================================
-# Profile scoring  (0–8)
+# Profile scoring  (0–7)
 # =============================================================================
 
-def _score_profile(
-    features: Dict[str, Any],
-    product: Dict[str, Any],
-) -> int:
+def _score_profile(features: Dict[str, Any]) -> int:
     """
-    Score client bureau profile. Range 0–8.
-    Score 0–3 → catalogue_item_1 (entry variant)
-    Score 4–8 → catalogue_item_2 (step-up variant)
+    Score client bureau profile. Range 0–7.
+
+    Score → Rank unlocked:
+      0 → no qualifying product (sorry message)
+      1 → Rank 2 (Best), Rank 1 (Next Best)
+      2 → Rank 3 (Best), Rank 2 (Next Best)
+      3 → Rank 4 (Best), Rank 3 (Next Best)
+      4 → Rank 5 (Best), Rank 4 (Next Best)
+      5 → Rank 6 (Best), Rank 5 (Next Best)
+      6 → Rank 7 (Best), Rank 6 (Next Best)
+      7 → Rank 8 (Best), Rank 7 (Next Best)
+
+    Signals:
+      credit_score >= 700  → +2
+      credit_score 600–699 → +1
+      credit_score < 600   → +0
+      is_employed          → +1
+      active_directorships = 1     → +1
+      active_directorships = 2–3   → +2
+      active_directorships = 4+    → +3
+      no adverse listings  → +1
     """
     score = 0
 
@@ -212,17 +245,23 @@ def _score_profile(
     if effective_score is not None:
         cs = _safe_int(effective_score, 0)
         if cs >= 700:
-            score += 3
-        elif cs >= 600:
             score += 2
-        elif cs > 0:
+        elif cs >= 600:
             score += 1
+        # < 600 → +0
 
     if features.get("is_employed"):
-        score += 2
+        score += 1
 
     active_dirs = _safe_int(features.get("active_directorships"), 0)
-    if active_dirs > 0 or features.get("has_active_directorship"):
+    # Fallback: if has_active_directorship flag is set but count is 0, treat as 1
+    if active_dirs == 0 and features.get("has_active_directorship"):
+        active_dirs = 1
+    if active_dirs >= 4:
+        score += 3
+    elif active_dirs >= 2:
+        score += 2
+    elif active_dirs == 1:
         score += 1
 
     adverse = _safe_int(features.get("adverse_accounts"), 0)
@@ -230,43 +269,68 @@ def _score_profile(
     if adverse == 0 and safps != "listed":
         score += 1
 
-    if product.get("existing_account_required") and features.get("has_fnb_account"):
-        score += 1
-
     return score
 
 
 # =============================================================================
-# Catalogue item selection
+# Catalogue item selection (rank-based)
 # =============================================================================
 
-def _select_catalogue_item(
+def _get_catalogue_items(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Parse and return catalogue_items array sorted ascending by rank.
+    Falls back to empty list if field is missing or malformed.
+    """
+    raw = _parse_json_field(product.get("catalogue_items"))
+    if not isinstance(raw, list):
+        return []
+    items = [i for i in raw if isinstance(i, dict) and "rank" in i]
+    return sorted(items, key=lambda x: int(x.get("rank", 0)))
+
+
+def _select_catalogue_items_by_rank(
     product: Dict[str, Any],
     features: Dict[str, Any],
-    offset: int = 0,
-) -> Optional[Dict[str, Any]]:
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], bool]:
     """
-    Select catalogue_item_1 or catalogue_item_2 based on profile score.
+    Select best and next_best catalogue items based on profile score.
 
-    offset=0 (best):      score 0–3 → item_1,  score 4–8 → item_2
-    offset=1 (next best): always the OTHER item from what offset=0 selected
+    Returns (best_item, next_best_item, is_sorry) where:
+      is_sorry=True  → score is 0, client does not qualify
+      is_sorry=False → normal ranked selection
+
+    Rank selection:
+      score 0 → sorry (no best, no next_best)
+      score 1 → best=rank2, next_best=rank1
+      score 2 → best=rank3, next_best=rank2
+      score N → best=rank(N+1), next_best=rank(N)
+      Capped at highest available rank in the product's catalogue_items.
     """
-    score = _score_profile(features, product)
+    items = _get_catalogue_items(product)
+    if not items:
+        return None, None, True
 
-    if offset == 0:
-        primary_key = "catalogue_item_1" if score <= 3 else "catalogue_item_2"
-        fallback_key = "catalogue_item_2" if score <= 3 else "catalogue_item_1"
-    else:
-        primary_key = "catalogue_item_2" if score <= 3 else "catalogue_item_1"
-        fallback_key = "catalogue_item_1" if score <= 3 else "catalogue_item_2"
+    score = _score_profile(features)
 
-    item = _parse_json_field(product.get(primary_key))
-    if isinstance(item, dict):
-        return item
+    # Score 0 — client does not qualify
+    if score == 0:
+        return None, None, True
 
-    item = _parse_json_field(product.get(fallback_key))
-    return item if isinstance(item, dict) else None
+    max_rank = len(items)  # e.g. 6 items → ranks 1–6
 
+    # Best rank index (0-based): score 1 → index 1 (rank 2), capped at max
+    best_idx      = min(score, max_rank - 1)
+    next_best_idx = best_idx - 1  # always one step below best
+
+    best_item      = items[best_idx]
+    next_best_item = items[next_best_idx] if next_best_idx >= 0 else None
+
+    return best_item, next_best_item, False
+
+
+# =============================================================================
+# Reason builder
+# =============================================================================
 
 def _build_reason_from_catalogue_item(item: Dict[str, Any]) -> str:
     """
@@ -299,38 +363,38 @@ def _build_reason_from_catalogue_item(item: Dict[str, Any]) -> str:
 def _extract_product_info(
     catalogue_item: Optional[Dict[str, Any]],
     product: Dict[str, Any],
+    is_sorry: bool = False,
 ) -> Dict[str, Any]:
     """
     Build the product info dict from a selected catalogue item.
 
-    product_name → from catalogue item's product_name / name / plan_name
-    reason       → from catalogue item's highlights + amount fields
-    product_code → from the master product record
-    tier         → from the master product record
+    When is_sorry=True and catalogue_item is None:
+      product_name → null
+      reason       → SORRY_MESSAGE
+      product_code → null
+      tier         → null
 
-    The master product_name is NEVER used for display.
+    Otherwise:
+      product_name → from catalogue item's product_name / name / plan_name
+      reason       → from catalogue item's highlights + amount fields
+      product_code → from the master product record
+      tier         → from the master product record
     """
-    if catalogue_item:
-        raw_name = (
-            catalogue_item.get("product_name")
-            or catalogue_item.get("name")
-            or catalogue_item.get("plan_name")
-            or ""
-        )
-        reason = _build_reason_from_catalogue_item(catalogue_item)
-    else:
-        raw_name = ""
-        benefits = product.get("benefits")
-        if isinstance(benefits, list):
-            reason = " | ".join([_clean_text(b) for b in benefits[:4] if b])
-        elif isinstance(benefits, str):
-            try:
-                bl     = json.loads(benefits)
-                reason = " | ".join([_clean_text(b) for b in bl[:4] if b])
-            except Exception:
-                reason = _clean_text(benefits)
-        else:
-            reason = _clean_text(product.get("description", ""))
+    if is_sorry or catalogue_item is None:
+        return {
+            "product_code": None,
+            "product_name": None,
+            "tier":         None,
+            "reason":       SORRY_MESSAGE if is_sorry else None,
+        }
+
+    raw_name = (
+        catalogue_item.get("product_name")
+        or catalogue_item.get("name")
+        or catalogue_item.get("plan_name")
+        or ""
+    )
+    reason = _build_reason_from_catalogue_item(catalogue_item)
 
     return {
         "product_code": product.get("product_code"),
@@ -480,8 +544,10 @@ def _recommend_for_interest(
     tier 1 product → BEST   (entry, most accessible)
     tier 2 product → NEXT BEST  (step-up within same category)
 
-    Catalogue item within each tier selected by profile score:
-      score 0–3 → catalogue_item_1,  score 4–8 → catalogue_item_2
+    Within each tier, catalogue item is selected by rank using profile score:
+      score 0 → sorry message on best, null next_best
+      score 1 → best=rank2, next_best=rank1
+      score N → best=rank(N+1), next_best=rank(N), capped at max available rank
 
     If tier 1 fails eligibility but tier 2 passes → tier 2 promoted to BEST.
     If both fail → best and next_best are None for this interest.
@@ -517,18 +583,32 @@ def _recommend_for_interest(
     next_best = None
 
     if tier1_ok:
-        best = _extract_product_info(
-            _select_catalogue_item(tier1, features, offset=0), tier1
+        best_item, next_best_item, is_sorry = _select_catalogue_items_by_rank(
+            tier1, features
         )
-    if tier2_ok:
-        next_best = _extract_product_info(
-            _select_catalogue_item(tier2, features, offset=0), tier2
-        )
+        best = _extract_product_info(best_item, tier1, is_sorry=is_sorry)
+        if next_best_item:
+            next_best = _extract_product_info(next_best_item, tier1, is_sorry=False)
 
-    # Tier 1 failed but tier 2 passed — promote tier 2 to best
-    if best is None and next_best is not None:
-        best      = next_best
-        next_best = None
+    if tier2_ok:
+        best_item2, next_best_item2, is_sorry2 = _select_catalogue_items_by_rank(
+            tier2, features
+        )
+        # Only surface tier 2 next_best if we have a real best from tier 1
+        if best is not None and not best.get("reason") == SORRY_MESSAGE:
+            if best_item2:
+                next_best = _extract_product_info(best_item2, tier2, is_sorry=False)
+
+    # Tier 1 failed eligibility but tier 2 passed — promote tier 2 to best
+    if (best is None or best.get("reason") == SORRY_MESSAGE) and tier2_ok:
+        best_item2, next_best_item2, is_sorry2 = _select_catalogue_items_by_rank(
+            tier2, features
+        )
+        best      = _extract_product_info(best_item2, tier2, is_sorry=is_sorry2)
+        next_best = (
+            _extract_product_info(next_best_item2, tier2, is_sorry=False)
+            if next_best_item2 else None
+        )
 
     return {
         "primary_interest": primary_interest,
@@ -594,7 +674,6 @@ def _has_null_product_columns(rec: Dict[str, Any]) -> bool:
 # =============================================================================
 # Row builder
 # Writes all 152 per-product columns + option_recommendations JSONB.
-# NO legacy flow-level columns — they do not exist in the current schema.
 # =============================================================================
 
 def _build_recommendation_row(
@@ -669,7 +748,7 @@ def generate_recommendation_for_customer(
       2. Ensure bureau_features exist (extract if missing)
       3. Skip if primary_interest unchanged AND row is already complete
       4. Run primary interest FIRST, then all 18 remaining interests
-      5. Write all 152 per-product columns in a single upsert
+      5. Write all 152 per-product columns in a single upserts
     """
 
     # 1. Load client — must exist in clients table
@@ -737,13 +816,6 @@ def generate_recommendation_for_customer(
         primary_interest, features, client_age
     )
 
-    primary_result = all_interest_results.get(primary_interest, {})
-    if not primary_result.get("best"):
-        return {
-            "status": "skipped",
-            "reason": f"no_eligible_products_for_interest: {primary_interest}",
-        }
-
     # 5. Build and upsert
     row = _build_recommendation_row(
         client_id=customer_id,
@@ -776,6 +848,8 @@ def generate_recommendation_for_customer(
     except APIError as e:
         return {"status": "error", "reason": f"upsert_failed: {e}"}
 
+    primary_result = all_interest_results.get(primary_interest, {})
+
     return {
         "status":            "success",
         "mode":              mode,
@@ -794,17 +868,6 @@ def generate_recommendation_for_customer(
 # Guarantees every client in clients table has a complete recommendation row
 # =============================================================================
 
-def _has_null_product_columns(rec: Dict[str, Any]) -> bool:
-    """
-    Returns True if ANY of the 19 best_product_name columns is null —
-    meaning this row has gaps that need to be filled.
-    """
-    for prefix in INTEREST_COLUMN_PREFIX.values():
-        if rec.get(f"{prefix}best_product_name") is None:
-            return True
-    return False
-
-
 def generate_recommendations_for_all_pending() -> Dict[str, Any]:
     """
     Ensures EVERY client in the clients table has a complete recommendation row.
@@ -815,7 +878,6 @@ def generate_recommendations_for_all_pending() -> Dict[str, Any]:
       3. Existing row has null values in any per-product column (gap-fill)
 
     Clients without a primary_interest are skipped.
-    Clients not in the clients table are never processed.
     """
     try:
         clients = (
